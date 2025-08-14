@@ -1,0 +1,11 @@
+# Core dependencies
+tqdm
+python-dotenv
+openai
+numpy
+loguru
+PyMuPDF
+
+# 需要高硬件资源
+# mineru[core]>=2.1.9
+# xinference>=1.8.0
