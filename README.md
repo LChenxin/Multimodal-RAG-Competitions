@@ -3,12 +3,6 @@
 
 本项目实现了一个完整的多模态 RAG（Retrieval-Augmented Generation）图文问答系统，支持从 PDF 文档解析、内容结构化、向量检索到大模型问答的全流程。
 
-## 快速开始
-
-```sh
-git clone https://github.com/li-xiu-qi/spark_multi_rag.git
-cd spark_multi_rag
-```
 
 ## 核心功能
 
