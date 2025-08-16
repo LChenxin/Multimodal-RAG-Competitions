@@ -5,11 +5,16 @@ import hashlib
 from typing import List, Dict, Any
 from tqdm import tqdm
 import sys
-sys.path.append(os.path.dirname(__file__))
+import concurrent.futures
+import random
+import torch
+
 from get_text_embedding import get_text_embedding
 
 from dotenv import load_dotenv
 from openai import OpenAI
+import time
+from openai import APIConnectionError, RateLimitError, APITimeoutError, APIError
 # 统一加载项目根目录的.env
 load_dotenv()
 
@@ -153,69 +158,170 @@ class SimpleRAG:
         }
 
 
+# if __name__ == '__main__':
+#     # 路径可根据实际情况调整
+#     chunk_json_path = os.path.join(os.path.dirname(__file__), 'all_pdf_page_chunks.json')
+#     rag = SimpleRAG(chunk_json_path)
+#     rag.setup()
+
+#     # 控制测试时读取的题目数量，默认只随机抽取10个，实际跑全部时设为None
+#     TEST_SAMPLE_NUM = None  # 设置为None则全部跑
+#     FILL_UNANSWERED = True  # 未回答的也输出默认内容
+
+#     # 批量评测脚本：读取测试集，检索+大模型生成，输出结构化结果
+#     test_path = os.path.join(os.path.dirname(__file__), 'datas/多模态RAG图文问答挑战赛测试集.json')
+#     if os.path.exists(test_path):
+#         with open(test_path, 'r', encoding='utf-8') as f:
+#             test_data = json.load(f)
+#         import concurrent.futures
+#         import random
+
+#         # 记录所有原始索引
+#         all_indices = list(range(len(test_data)))
+#         # 随机抽取部分题目用于测试
+#         selected_indices = all_indices
+#         if TEST_SAMPLE_NUM is not None and TEST_SAMPLE_NUM > 0:
+#             if len(test_data) > TEST_SAMPLE_NUM:
+#                 selected_indices = sorted(random.sample(all_indices, TEST_SAMPLE_NUM))
+
+#         def process_one(idx):
+#             item = test_data[idx]
+#             question = item['question']
+#             tqdm.write(f"[{selected_indices.index(idx)+1}/{len(selected_indices)}] 正在处理: {question[:30]}...")
+#             result = rag.generate_answer(question, top_k=5)
+#             return idx, result
+
+#         results = []
+#         if selected_indices:
+#             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+#                 results = list(tqdm(executor.map(process_one, selected_indices), total=len(selected_indices), desc='并发批量生成'))
+
+#         # 先输出一份未过滤的原始结果（含 idx）
+#         import json
+#         raw_out_path = os.path.join(os.path.dirname(__file__), 'rag_top1_pred_raw.json')
+#         with open(raw_out_path, 'w', encoding='utf-8') as f:
+#             json.dump(results, f, ensure_ascii=False, indent=2)
+#         print(f'已输出原始未过滤结果到: {raw_out_path}')
+
+#         # 只保留结果部分，并去除 retrieval_chunks 字段
+#         idx2result = {idx: {k: v for k, v in r.items() if k != 'retrieval_chunks'} for idx, r in results}
+#         filtered_results = []
+#         for idx, item in enumerate(test_data):
+#             if idx in idx2result:
+#                 filtered_results.append(idx2result[idx])
+#             elif FILL_UNANSWERED:
+#                 # 未被回答的，补默认内容
+#                 filtered_results.append({
+#                     "question": item.get("question", ""),
+#                     "answer": "",
+#                     "filename": "",
+#                     "page": "",
+#                 })
+#         # 输出结构化结果到json
+#         out_path = os.path.join(os.path.dirname(__file__), 'rag_top1_pred.json')
+#         with open(out_path, 'w', encoding='utf-8') as f:
+#             json.dump(filtered_results, f, ensure_ascii=False, indent=2)
+#         print(f'已输出结构化检索+大模型生成结果到: {out_path}')
+    
+        
+        
 if __name__ == '__main__':
+    from pathlib import Path
+
     # 路径可根据实际情况调整
-    chunk_json_path = os.path.join(os.path.dirname(__file__), 'all_pdf_page_chunks.json')
+    chunk_json_path = "./all_pdf_page_chunks.json"
     rag = SimpleRAG(chunk_json_path)
     rag.setup()
 
     # 控制测试时读取的题目数量，默认只随机抽取10个，实际跑全部时设为None
-    TEST_SAMPLE_NUM = 10  # 设置为None则全部跑
+    TEST_SAMPLE_NUM = None  # 设置为None则全部跑
     FILL_UNANSWERED = True  # 未回答的也输出默认内容
 
     # 批量评测脚本：读取测试集，检索+大模型生成，输出结构化结果
-    test_path = os.path.join(os.path.dirname(__file__), 'datas/多模态RAG图文问答挑战赛测试集.json')
-    if os.path.exists(test_path):
-        with open(test_path, 'r', encoding='utf-8') as f:
-            test_data = json.load(f)
-        import concurrent.futures
-        import random
+    test_path = "./datas/test.json"
+    if not os.path.exists(test_path):
+        print("datas/test.json 不存在")
+        sys.exit(1)
 
-        # 记录所有原始索引
-        all_indices = list(range(len(test_data)))
-        # 随机抽取部分题目用于测试
+    with open(test_path, 'r', encoding='utf-8') as f:
+        test_data = json.load(f)
+
+    # ============= 新增：通过“索引区间”来只处理一段 =============
+    # 支持三种设置方式：
+    # 1) 环境变量：BATCH_START, BATCH_SIZE
+    # 2) 命令行：python rag_from_page_chunks.py 0 200
+    # 3) 默认：全量（不建议长跑；建议分段跑）
+    BATCH_START = int(os.getenv("BATCH_START", "-1"))
+    BATCH_SIZE  = int(os.getenv("BATCH_SIZE",  "-1"))
+    if len(sys.argv) >= 3:
+        BATCH_START = int(sys.argv[1])
+        BATCH_SIZE  = int(sys.argv[2])
+
+    all_indices = list(range(len(test_data)))
+
+    # 随机抽样（可选）
+    if TEST_SAMPLE_NUM is not None and TEST_SAMPLE_NUM > 0 and len(test_data) > TEST_SAMPLE_NUM:
+        all_indices = sorted(random.sample(all_indices, TEST_SAMPLE_NUM))
+
+    # 计算本次要处理的 selected_indices
+    if BATCH_START >= 0 and BATCH_SIZE > 0:
+        end = min(BATCH_START + BATCH_SIZE, len(test_data))
+        selected_indices = list(range(BATCH_START, end))
+        print(f"仅处理索引区间 [{BATCH_START}, {end-1}] ，共 {len(selected_indices)} 条")
+    else:
         selected_indices = all_indices
-        if TEST_SAMPLE_NUM is not None and TEST_SAMPLE_NUM > 0:
-            if len(test_data) > TEST_SAMPLE_NUM:
-                selected_indices = sorted(random.sample(all_indices, TEST_SAMPLE_NUM))
+        print(f"未指定分段，默认处理全部：共 {len(selected_indices)} 条（不建议长跑）")
 
-        def process_one(idx):
-            item = test_data[idx]
-            question = item['question']
-            tqdm.write(f"[{selected_indices.index(idx)+1}/{len(selected_indices)}] 正在处理: {question[:30]}...")
-            result = rag.generate_answer(question, top_k=5)
-            return idx, result
+    # parts 目录：每段单独落盘
+    PART_DIR = Path("./parts")
+    PART_DIR.mkdir(exist_ok=True)
 
-        results = []
-        if selected_indices:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                results = list(tqdm(executor.map(process_one, selected_indices), total=len(selected_indices), desc='并发批量生成'))
+    def process_one(idx):
+        item = test_data[idx]
+        question = item['question']
+        tqdm.write(f"[{selected_indices.index(idx)+1}/{len(selected_indices)}] 正在处理: {question[:30]}...")
+        time.sleep(1)  # 维持你原来的最小限流
+        # 如需更稳，可在这里加 try/except 返回空答以避免整批失败
+        result = rag.generate_answer(question, top_k=5)
+        return idx, result
 
-        # 先输出一份未过滤的原始结果（含 idx）
-        import json
-        raw_out_path = os.path.join(os.path.dirname(__file__), 'rag_top1_pred_raw.json')
-        with open(raw_out_path, 'w', encoding='utf-8') as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f'已输出原始未过滤结果到: {raw_out_path}')
+    # 并发执行（保持你现有写法与并发度）
+    results = []
+    if selected_indices:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            results = list(tqdm(
+                executor.map(process_one, selected_indices),
+                total=len(selected_indices),
+                desc='并发批量生成'
+            ))
 
-        # 只保留结果部分，并去除 retrieval_chunks 字段
-        idx2result = {idx: {k: v for k, v in r.items() if k != 'retrieval_chunks'} for idx, r in results}
-        filtered_results = []
-        for idx, item in enumerate(test_data):
-            if idx in idx2result:
-                filtered_results.append(idx2result[idx])
-            elif FILL_UNANSWERED:
-                # 未被回答的，补默认内容
-                filtered_results.append({
-                    "question": item.get("question", ""),
-                    "answer": "",
-                    "filename": "",
-                    "page": "",
-                })
-        # 输出结构化结果到json
-        out_path = os.path.join(os.path.dirname(__file__), 'rag_top1_pred.json')
-        with open(out_path, 'w', encoding='utf-8') as f:
-            json.dump(filtered_results, f, ensure_ascii=False, indent=2)
-        print(f'已输出结构化检索+大模型生成结果到: {out_path}')
-    
-        
+    # —— 本段原始结果（含 idx）单独落盘 —— #
+    part_tag = f"{selected_indices[0]:06d}_{selected_indices[-1]:06d}" if selected_indices else "empty"
+    raw_out_path = PART_DIR / f"raw_{part_tag}.json"
+    with open(raw_out_path, 'w', encoding='utf-8') as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f'已输出本段原始结果: {raw_out_path}')
+
+    # —— 本段结构化（去掉 retrieval_chunks）也单独落盘，便于最终合并 —— #
+    idx2result = {idx: {k: v for k, v in r.items() if k != 'retrieval_chunks'} for idx, r in results}
+    filtered_results = []
+    for idx in selected_indices:
+        if idx in idx2result:
+            filtered_results.append(idx2result[idx])
+        elif FILL_UNANSWERED:
+            filtered_results.append({
+                "question": test_data[idx].get("question", ""),
+                "answer": "",
+                "filename": "",
+                "page": "",
+            })
+
+    part_out_path = PART_DIR / f"part_{part_tag}.json"
+    tmp_path = str(part_out_path) + ".tmp"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(filtered_results, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, part_out_path)
+    print(f'已输出本段结构化结果: {part_out_path}')
+
+    # ——（可选）如果你恰好跑的是全量且只想直接生成最终文件，也可以在此合并 —— #
+    # 否则建议使用我提供的 merge_parts.py 独立一步合并所有 part_*.json
