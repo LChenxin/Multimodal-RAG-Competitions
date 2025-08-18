@@ -15,8 +15,57 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import time
 from openai import APIConnectionError, RateLimitError, APITimeoutError, APIError
+
+
 # 统一加载项目根目录的.env
 load_dotenv()
+
+import os, requests
+
+class SiliconFlowReranker:
+    def __init__(self, api_key: str = None,
+                 model: str = "BAAI/bge-reranker-v2-m3",
+                 endpoint: str = "https://api.siliconflow.cn/v1/rerank",
+                 timeout: int = 30):
+        self.api_key = os.getenv('LOCAL_API_KEY')
+        if not self.api_key:
+            raise ValueError("Missing SILICONFLOW_API_KEY")
+        self.model = model
+        self.endpoint = endpoint
+        self.timeout = timeout
+
+    def rerank(self, question: str, candidates: list):
+        # candidates: list of dicts with keys: 'content', 'metadata': {'file_name','page'}
+        docs = [c["content"] for c in candidates]
+        payload = {"model": self.model, "query": question, "documents": docs}
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        r = requests.post(self.endpoint, json=payload, headers=headers, timeout=self.timeout)
+        r.raise_for_status()
+        data = r.json()
+
+        # SiliconFlow returns a list of results with {index, relevance_score}
+        # (Long docs are auto-chunked server-side; highest sub-chunk score is used per doc.) :contentReference[oaicite:1]{index=1}
+        results = data.get("results") or data.get("data") or []
+        # attach scores back to your candidate objects
+        scored = []
+        for res in results:
+            idx = res.get("index")
+            if idx is None or idx >= len(candidates): 
+                continue
+            c = dict(candidates[idx])  # shallow copy
+            c["rerank_score"] = float(res.get("relevance_score", 0.0))
+            scored.append(c)
+
+        # If API didn’t return for all docs, keep the rest with score 0
+        seen = {res.get("index") for res in results if res.get("index") is not None}
+        for i, c in enumerate(candidates):
+            if i not in seen:
+                cc = dict(c)
+                cc["rerank_score"] = cc.get("rerank_score", 0.0)
+                scored.append(cc)
+
+        return sorted(scored, key=lambda x: x["rerank_score"], reverse=True)
+
 
 class PageChunkLoader:
     def __init__(self, json_path: str):
@@ -46,7 +95,7 @@ class EmbeddingModel:
 
     def embed_text(self, text: str) -> List[float]:
         return self.embed_texts([text])[0]
-
+    
 class SimpleVectorStore:
     def __init__(self):
         self.embeddings = []
@@ -66,95 +115,146 @@ class SimpleVectorStore:
         idxs = sims.argsort()[::-1][:top_k]
         return [self.chunks[i] for i in idxs]
 
+
 class SimpleRAG:
-    def __init__(self, chunk_json_path: str, model_path: str = None, batch_size: int = 32):
+    def __init__(
+        self,
+        chunk_json_path: str,
+        model_path: str = None,
+        batch_size: int = 32,
+        use_rerank: bool = False,
+        candidate_k: int = 120,
+        final_k: int = 5,
+        reranker=None,  # expect your HybridReranker instance
+    ):
         self.loader = PageChunkLoader(chunk_json_path)
         self.embedding_model = EmbeddingModel(batch_size=batch_size)
         self.vector_store = SimpleVectorStore()
+
+        # Rerank controls
+        self.use_rerank = use_rerank
+        self.candidate_k = candidate_k
+        self.final_k = final_k
+        self.reranker = reranker
+
     def setup(self):
         print("加载所有页chunk...")
         chunks = self.loader.load_chunks()
         print(f"共加载 {len(chunks)} 个chunk")
         print("生成嵌入...")
-        embeddings = self.embedding_model.embed_texts([c['content'] for c in chunks])
+        embeddings = self.embedding_model.embed_texts([c["content"] for c in chunks])
         print("存储向量...")
         self.vector_store.add_chunks(chunks, embeddings)
         print("RAG向量库构建完成！")
+
     def query(self, question: str, top_k: int = 3) -> Dict[str, Any]:
         q_emb = self.embedding_model.embed_text(question)
         results = self.vector_store.search(q_emb, top_k)
-        return {
-            "question": question,
-            "chunks": results
-        }
+        return {"question": question, "chunks": results}
+
+    def _build_context(self, items: List[Dict[str, Any]]) -> str:
+        return "\n".join(
+            [
+                f"[文件名]{c['metadata']['file_name']} [页码]{c['metadata']['page']}\n{c['content']}"
+                for c in items
+            ]
+        )
 
     def generate_answer(self, question: str, top_k: int = 3) -> Dict[str, Any]:
         """
         检索+大模型生成式回答，返回结构化结果
         """
-        qwen_api_key = os.getenv('LOCAL_API_KEY')
-        qwen_base_url = os.getenv('LOCAL_BASE_URL')
-        qwen_model = os.getenv('LOCAL_TEXT_MODEL')
+        qwen_api_key = os.getenv("LOCAL_API_KEY")
+        qwen_base_url = os.getenv("LOCAL_BASE_URL")
+        qwen_model = os.getenv("LOCAL_TEXT_MODEL")
         if not qwen_api_key or not qwen_base_url or not qwen_model:
-            raise ValueError('请在.env中配置LOCAL_API_KEY、LOCAL_BASE_URL、LOCAL_TEXT_MODEL')
+            raise ValueError("请在.env中配置LOCAL_API_KEY、LOCAL_BASE_URL、LOCAL_TEXT_MODEL")
+
+        # ------ Retrieval (+ optional rerank) ------
         q_emb = self.embedding_model.embed_text(question)
-        chunks = self.vector_store.search(q_emb, top_k)
-        # 拼接检索内容，带上元数据
-        context = "\n".join([
-            f"[文件名]{c['metadata']['file_name']} [页码]{c['metadata']['page']}\n{c['content']}" for c in chunks
-        ])
-        # 明确要求输出JSON格式 answer/page/filename
+
+        if self.use_rerank and self.reranker is not None:
+            # Stage A: larger pool
+            candidates = self.vector_store.search(q_emb, self.candidate_k)
+            if candidates:
+                # Stage B: rerank
+                ranked = self.reranker.rerank(question, candidates)
+                chunks = ranked[: self.final_k]
+            else:
+                chunks = []
+        else:
+            # Baseline
+            chunks = self.vector_store.search(q_emb, top_k)
+
+        # Build LLM context
+        context = self._build_context(chunks)
+
+        # ------ LLM call (unchanged) ------
         prompt = (
-            f"你是一名专业的金融分析助手，请根据以下检索到的内容回答用户问题。\n"
-            f"请严格按照如下JSON格式输出：\n"
-            f'{{"answer": "你的简洁回答", "filename": "来源文件名", "page": "来源页码"}}'"\n"
+            "你是一名专业的金融分析助手，请根据以下检索到的内容回答用户问题。\n"
+            "请严格按照如下JSON格式输出：\n"
+            '{"answer": "你的简洁回答", "filename": "来源文件名", "page": "来源页码"}\n'
             f"检索内容：\n{context}\n\n问题：{question}\n"
-            f"请确保输出内容为合法JSON字符串，不要输出多余内容。"
+            "请确保输出内容为合法JSON字符串，不要输出多余内容。"
         )
+
         client = OpenAI(api_key=qwen_api_key, base_url=qwen_base_url)
         completion = client.chat.completions.create(
             model=qwen_model,
             messages=[
                 {"role": "system", "content": "你是一名专业的金融分析助手。"},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=1024
+            max_tokens=1024,
         )
+
         import json as pyjson
-        sys.path.append(os.path.dirname(__file__))
         from extract_json_array import extract_json_array
+
         raw = completion.choices[0].message.content.strip()
-        # 用 extract_json_array 提取 JSON 对象
-        json_str = extract_json_array(raw, mode='objects')
+        json_str = extract_json_array(raw, mode="objects")
+
         if json_str:
             try:
                 arr = pyjson.loads(json_str)
-                # 只取第一个对象
                 if isinstance(arr, list) and arr:
                     j = arr[0]
-                    answer = j.get('answer', '')
-                    filename = j.get('filename', '')
-                    page = j.get('page', '')
+                    answer = j.get("answer", "")
+                    filename = j.get("filename", "")
+                    page = j.get("page", "")
                 else:
                     answer = raw
-                    filename = chunks[0]['metadata']['file_name'] if chunks else ''
-                    page = chunks[0]['metadata']['page'] if chunks else ''
+                    filename = chunks[0]["metadata"]["file_name"] if chunks else ""
+                    page = chunks[0]["metadata"]["page"] if chunks else ""
             except Exception:
                 answer = raw
-                filename = chunks[0]['metadata']['file_name'] if chunks else ''
-                page = chunks[0]['metadata']['page'] if chunks else ''
+                filename = chunks[0]["metadata"]["file_name"] if chunks else ""
+                page = chunks[0]["metadata"]["page"] if chunks else ""
         else:
             answer = raw
-            filename = chunks[0]['metadata']['file_name'] if chunks else ''
-            page = chunks[0]['metadata']['page'] if chunks else ''
-        # 结构化输出
+            filename = chunks[0]["metadata"]["file_name"] if chunks else ""
+            page = chunks[0]["metadata"]["page"] if chunks else ""
+
+        # ------ Source fallback/override from best evidence (place it HERE) ------
+        if chunks:
+            best_file = chunks[0]["metadata"]["file_name"]
+            best_page = chunks[0]["metadata"]["page"]
+            # Fallback: only fill if model didn't provide values
+            if not filename:
+                filename = best_file
+            if not page:
+                page = best_page
+            # If you prefer to ALWAYS trust retrieval/rerank for grading:
+            # filename, page = best_file, best_page
+
+        # Final return
         return {
             "question": question,
             "answer": answer,
             "filename": filename,
             "page": page,
-            "retrieval_chunks": chunks
+            "retrieval_chunks": chunks,
         }
 
 
@@ -230,7 +330,16 @@ if __name__ == '__main__':
 
     # 路径可根据实际情况调整
     chunk_json_path = "./all_pdf_page_chunks.json"
-    rag = SimpleRAG(chunk_json_path)
+    reranker = SiliconFlowReranker()
+    
+    #rag = SimpleRAG(chunk_json_path)
+    rag = SimpleRAG(
+    chunk_json_path=chunk_json_path,  # or your page/block chunk file
+    use_rerank=True,
+    candidate_k=60,
+    final_k=5,
+    reranker=reranker,
+)
     rag.setup()
 
     # 控制测试时读取的题目数量，默认只随机抽取10个，实际跑全部时设为None
