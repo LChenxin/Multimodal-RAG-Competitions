@@ -70,45 +70,69 @@ class SiliconFlowReranker:
     def __init__(self, api_key: str = None,
                  model: str = "BAAI/bge-reranker-v2-m3",
                  endpoint: str = "https://api.siliconflow.cn/v1/rerank",
-                 timeout: int = 30):
-        self.api_key = os.getenv('LOCAL_API_KEY')
+                 timeout: int = 30,
+                 max_retries: int = 4):
+        self.api_key = api_key or os.getenv('LOCAL_API_KEY')
         if not self.api_key:
             raise ValueError("Missing SILICONFLOW_API_KEY")
         self.model = model
         self.endpoint = endpoint
         self.timeout = timeout
+        self.max_retries = max_retries
 
-    def rerank(self, question: str, candidates: list):
-        # candidates: list of dicts with keys: 'content', 'metadata': {'file_name','page'}
+    def rerank(self, question: str, candidates: list, return_meta: bool = False):
+        """
+        Returns:
+          ranked_chunks, meta where meta = {"status": http_status or None, "attempts": N}
+        Retries on 429/5xx with exponential backoff.
+        """
+        import time, requests
+
         docs = [c["content"] for c in candidates]
         payload = {"model": self.model, "query": question, "documents": docs}
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        r = requests.post(self.endpoint, json=payload, headers=headers, timeout=self.timeout)
-        r.raise_for_status()
-        data = r.json()
 
-        # SiliconFlow returns a list of results with {index, relevance_score}
-        # (Long docs are auto-chunked server-side; highest sub-chunk score is used per doc.) :contentReference[oaicite:1]{index=1}
-        results = data.get("results") or data.get("data") or []
-        # attach scores back to your candidate objects
-        scored = []
-        for res in results:
-            idx = res.get("index")
-            if idx is None or idx >= len(candidates): 
-                continue
-            c = dict(candidates[idx])  # shallow copy
-            c["rerank_score"] = float(res.get("relevance_score", 0.0))
-            scored.append(c)
+        status = None
+        attempts = 0
+        data = None
 
-        # If API didn’t return for all docs, keep the rest with score 0
-        seen = {res.get("index") for res in results if res.get("index") is not None}
-        for i, c in enumerate(candidates):
-            if i not in seen:
-                cc = dict(c)
-                cc["rerank_score"] = cc.get("rerank_score", 0.0)
-                scored.append(cc)
+        for attempt in range(self.max_retries):
+            attempts = attempt + 1
+            try:
+                r = requests.post(self.endpoint, json=payload, headers=headers, timeout=self.timeout)
+                status = r.status_code
+                if status in (429, 500, 502, 503, 504):
+                    time.sleep(2 ** attempt)  # backoff
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                break
+            except requests.RequestException:
+                time.sleep(2 ** attempt)
 
-        return sorted(scored, key=lambda x: x["rerank_score"], reverse=True)
+        ranked = []
+        if data:
+            results = data.get("results") or data.get("data") or []
+            seen = set()
+            for res in results:
+                idx = res.get("index")
+                if idx is None or idx >= len(candidates):
+                    continue
+                seen.add(idx)
+                c = dict(candidates[idx])
+                c["rerank_score"] = float(res.get("relevance_score", 0.0))
+                ranked.append(c)
+            for i, c in enumerate(candidates):
+                if i not in seen:
+                    cc = dict(c)
+                    cc["rerank_score"] = 0.0
+                    ranked.append(cc)
+            ranked.sort(key=lambda x: x["rerank_score"], reverse=True)
+
+        if return_meta:
+            return ranked, {"status": status, "attempts": attempts}
+        return ranked
+
 
 
 class PageChunkLoader:
@@ -180,6 +204,11 @@ class SimpleRAG:
         self.candidate_k = candidate_k
         self.final_k = final_k
         self.reranker = reranker
+        
+        # NEW: control behavior & logging via env or code
+        self.lock_source = bool(int(os.getenv("LOCK_SOURCE", "0")))         # force filename/page to top rerank
+        self.strict_rerank = bool(int(os.getenv("STRICT_RERANK", "0")))     # raise if rerank fails
+        self.debug_telemetry = bool(int(os.getenv("DEBUG_RAG", "1")))       # return debug info
 
     def setup(self):
         print("加载所有页chunk...")
@@ -214,37 +243,63 @@ class SimpleRAG:
         if not qwen_api_key or not qwen_base_url or not qwen_model:
             raise ValueError("请在.env中配置LOCAL_API_KEY、LOCAL_BASE_URL、LOCAL_TEXT_MODEL")
 
-        # ------ Retrieval (+ optional rerank) ------
+        # ------ Retrieval (+ optional rerank) with telemetry ------
+        tele = {"path":"", "rerank_ok":False, "rerank_attempts":0, "rerank_http":None,
+                "cand_n":0, "ranked_n":0, "page_vote_n":0, "final_n":0}
+
         q_emb = self.embedding_model.embed_text(question)
+        candidates = self.vector_store.search(q_emb, self.candidate_k)
+        tele["cand_n"] = len(candidates)
 
-        if self.use_rerank and self.reranker is not None:
-            # Stage A: larger pool
-            candidates = self.vector_store.search(q_emb, self.candidate_k)
-            if candidates:
-                # Stage B: rerank
-                ranked = self.reranker.rerank(question, candidates)
+        if self.use_rerank and self.reranker is not None and candidates:
+            tele["path"] = "rerank"
+            ranked, rr_meta = self.reranker.rerank(question, candidates, return_meta=True)  # << needs return_meta support
+            tele["rerank_http"] = rr_meta.get("status")
+            tele["rerank_attempts"] = rr_meta.get("attempts")
+            tele["ranked_n"] = len(ranked)
+            tele["rerank_ok"] = bool(ranked)
 
-                #### CHANGE PAGE VOTE START ###
+            if not ranked:
+                if getattr(self, "strict_rerank", False):
+                    raise RuntimeError(f"Rerank failed (status={tele['rerank_http']}) and STRICT_RERANK=1")
+                chunks = candidates[: self.final_k]
+                tele["final_n"] = len(chunks)
+            else:
+                # page vote + neighbor expansion (forced)
                 page_best = page_vote(ranked, top_m_pages=1, agg="max")
-
+                tele["page_vote_n"] = len(page_best)
                 try:
                     page_best = expand_neighbors_on_page(page_best, radius=1, max_total=self.final_k)
                 except Exception:
-                    # Fallback if widx missing: just take top-K from this page
                     page_best = page_best[: self.final_k]
-                    
                 chunks = page_best if page_best else ranked[: self.final_k]
-                #chunks = ranked[: self.final_k]
-            else:
-                chunks = []
+                tele["final_n"] = len(chunks)
         else:
-            # Baseline
-            chunks = self.vector_store.search(q_emb, top_k)
+            tele["path"] = "baseline"
+            chunks = candidates[: top_k]
+            tele["final_n"] = len(chunks)
 
-        # Build LLM context
+        # Early exit if we truly have nothing
+        if not chunks:
+            out = {
+                "question": question,
+                "answer": "",
+                "filename": "",
+                "page": "",
+                "retrieval_chunks": [],
+            }
+            if getattr(self, "debug_telemetry", True):
+                out["debug"] = tele
+            return out
+
+        # Keep a record of top evidence before LLM (also used for LOCK_SOURCE)
+        top_file = chunks[0]['metadata']['file_name']
+        top_page = chunks[0]['metadata']['page']
+
+        # Build LLM context  << you were missing this
         context = self._build_context(chunks)
 
-        # ------ LLM call (unchanged) ------
+        # ------ LLM call ------
         prompt = (
             "你是一名专业的金融分析助手，请根据以下检索到的内容回答用户问题。\n"
             "请严格按照如下JSON格式输出：\n"
@@ -280,37 +335,50 @@ class SimpleRAG:
                     page = j.get("page", "")
                 else:
                     answer = raw
-                    filename = chunks[0]["metadata"]["file_name"] if chunks else ""
-                    page = chunks[0]["metadata"]["page"] if chunks else ""
+                    filename = top_file
+                    page = top_page
             except Exception:
                 answer = raw
-                filename = chunks[0]["metadata"]["file_name"] if chunks else ""
-                page = chunks[0]["metadata"]["page"] if chunks else ""
+                filename = top_file
+                page = top_page
         else:
             answer = raw
-            filename = chunks[0]["metadata"]["file_name"] if chunks else ""
-            page = chunks[0]["metadata"]["page"] if chunks else ""
+            filename = top_file
+            page = top_page
 
-        # ------ Source fallback/override from best evidence (place it HERE) ------
-        if chunks:
-            best_file = chunks[0]["metadata"]["file_name"]
-            best_page = chunks[0]["metadata"]["page"]
-            # Fallback: only fill if model didn't provide values
-            if not filename:
-                filename = best_file
-            if not page:
-                page = best_page
-            # If you prefer to ALWAYS trust retrieval/rerank for grading:
-            # filename, page = best_file, best_page
+        # Optional: normalize page & apply offset if needed (e.g., MinerU 0-based -> leaderboard 1-based)
+        PAGE_OFFSET = int(os.getenv("PAGE_OFFSET", "0"))
+        try:
+            if page not in ("", None):
+                page = int(page) + PAGE_OFFSET
+        except Exception:
+            # if the model returns non-int, fall back to top evidence page + offset
+            try:
+                page = int(top_page) + PAGE_OFFSET
+            except Exception:
+                page = top_page  # last resort
 
-        # Final return
-        return {
+        # Hard-lock filename/page to top evidence if requested
+        model_file, model_page = filename, page
+        if getattr(self, "lock_source", False) and chunks:
+            filename, page = top_file, (int(top_page) + PAGE_OFFSET if str(top_page).isdigit() else top_page)
+
+        out = {
             "question": question,
             "answer": answer,
             "filename": filename,
             "page": page,
             "retrieval_chunks": chunks,
         }
+        if getattr(self, "debug_telemetry", True):
+            tele.update({
+                "top_file": top_file, "top_page": top_page,
+                "model_file": model_file, "model_page": model_page
+            })
+            out["debug"] = tele
+        return out
+
+
 
 
 # if __name__ == '__main__':
