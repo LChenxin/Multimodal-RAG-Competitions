@@ -20,6 +20,50 @@ from openai import APIConnectionError, RateLimitError, APITimeoutError, APIError
 # 统一加载项目根目录的.env
 load_dotenv()
 
+# Add these helpers near your RAG class
+
+from collections import defaultdict
+import numpy as np
+
+def page_vote(ranked_chunks, top_m_pages=1, agg="max"):
+    """
+    ranked_chunks: list already reranked by your reranker (desc)
+    Aggregate scores per (file_name, page) and return chunks from the winning page(s).
+    """
+    buckets = defaultdict(list)
+    for c in ranked_chunks:
+        key = (c["metadata"]["file_name"], int(c["metadata"]["page"]))
+        s = c.get("rerank_score", c.get("ret_score", 0.0))
+        buckets[key].append(float(s))
+
+    def agg_fn(v):
+        v = np.asarray(v, float)
+        if agg == "sum": return v.sum()
+        if agg == "mean": return v.mean()
+        return v.max()
+
+    scored_pages = sorted([(k, agg_fn(v)) for k, v in buckets.items()], key=lambda x: x[1], reverse=True)
+    keep_keys = set(k for k,_ in scored_pages[:top_m_pages])
+    return [c for c in ranked_chunks if (c["metadata"]["file_name"], int(c["metadata"]["page"])) in keep_keys]
+
+def expand_neighbors_on_page(page_chunks, radius=1, max_total=8):
+    # Assumes all chunks are from the same (file,page); use their widx to add neighbors
+    page_chunks = sorted(page_chunks, key=lambda x: x["metadata"].get("widx", 0))
+    out = []
+    picked = set()
+    for c in page_chunks[:max_total]:
+        w = c["metadata"].get("widx", 0)
+        for j in range(max(0, w - radius), min(len(page_chunks), w + radius + 1)):
+            cj = page_chunks[j]
+            key = cj["metadata"].get("widx", j)
+            if key in picked: 
+                continue
+            picked.add(key); out.append(cj)
+            if len(out) >= max_total: 
+                return out
+    return out or page_chunks[:max_total]
+
+
 import os, requests
 
 class SiliconFlowReranker:
@@ -179,7 +223,18 @@ class SimpleRAG:
             if candidates:
                 # Stage B: rerank
                 ranked = self.reranker.rerank(question, candidates)
-                chunks = ranked[: self.final_k]
+
+                #### CHANGE PAGE VOTE START ###
+                page_best = page_vote(ranked, top_m_pages=1, agg="max")
+
+                try:
+                    page_best = expand_neighbors_on_page(page_best, radius=1, max_total=self.final_k)
+                except Exception:
+                    # Fallback if widx missing: just take top-K from this page
+                    page_best = page_best[: self.final_k]
+                    
+                chunks = page_best if page_best else ranked[: self.final_k]
+                #chunks = ranked[: self.final_k]
             else:
                 chunks = []
         else:
@@ -329,7 +384,7 @@ if __name__ == '__main__':
     from pathlib import Path
 
     # 路径可根据实际情况调整
-    chunk_json_path = "./all_pdf_page_chunks.json"
+    chunk_json_path = "./all_pdf_windows_mineru.json"
     reranker = SiliconFlowReranker()
     
     #rag = SimpleRAG(chunk_json_path)
