@@ -459,7 +459,7 @@ if __name__ == '__main__':
     rag = SimpleRAG(
     chunk_json_path=chunk_json_path,  # or your page/block chunk file
     use_rerank=True,
-    candidate_k=60,
+    candidate_k=100,
     final_k=5,
     reranker=reranker,
 )
