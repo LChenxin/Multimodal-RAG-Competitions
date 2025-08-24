@@ -32,3 +32,17 @@ def get_image_analysis_prompt(title_max_length: int, description_max_length: int
 
 只返回JSON，不要有其他说明文字。
 """
+# image_utils/prompts.py
+def get_chart_analysis_prompt(max_bullets: int = 6) -> str:
+    return f"""你将看到一张图表（可能包含多条折线/柱状图）。请仅根据图中可见内容，提取结构化信息并返回 JSON：
+
+必须字段：
+- "title": 简短标题（不超过 40 字）
+- "type": 图表类型（如 折线图/柱状图/饼图/散点图/其他）
+- "series": 数组，每个元素是图例/系列名称（若无法看清，用""）
+- "x_range": 横轴范围或时间跨度（如"2020–2025Q1"，未知则""）
+- "y_unit": 纵轴单位（如"%" 或 "亿元"，未知则""）
+- "bullets": 不超过 {max_bullets} 条要点，聚焦趋势/极值/交叉（如"2024毛利率约26%"）；仅写你能从图上读出的信息
+
+严格输出 JSON，不要多余文本。若看不清请用空字符串或空数组，不要编造数值。
+"""

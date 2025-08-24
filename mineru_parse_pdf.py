@@ -236,12 +236,12 @@ if __name__ == '__main__':
             doc_path_list.append(doc_path)
 
     """如果您由于网络问题无法下载模型，可以设置环境变量 MINERU_MODEL_SOURCE 为 modelscope，使用免代理仓库下载模型"""
-    # os.environ['MINERU_MODEL_SOURCE'] = "modelscope"
+    os.environ['MINERU_MODEL_SOURCE'] = "modelscope"
 
     """如环境不支持 VLM，可使用 pipeline 模式"""
-    parse_doc(doc_path_list, output_dir, backend="pipeline")
+    #parse_doc(doc_path_list, output_dir, backend="pipeline")
 
     """如需启用 VLM 模式，将 backend 改为 'vlm-xxx'"""
-    # parse_doc(doc_path_list, output_dir, backend="vlm-transformers")  # 通用。
+    parse_doc(doc_path_list, output_dir, backend="vlm-transformers")  # 通用。
     # parse_doc(doc_path_list, output_dir, backend="vlm-sglang-engine")  # 更快（engine）。
     # parse_doc(doc_path_list, output_dir, backend="vlm-sglang-client", server_url="http://127.0.0.1:30000")  # 更快（client）。
