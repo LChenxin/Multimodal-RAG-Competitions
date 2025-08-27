@@ -6,25 +6,36 @@ from collections import defaultdict
 import asyncio
 from image_utils.async_image_analysis import AsyncImageAnalysis
 
-def parse_all_pdfs(datas_dir, output_base_dir, backend="pipeline"):
-    """
-    步骤1：解析所有PDF，输出内容到 data_base_json_content/
-    """
+def parse_all_pdfs(datas_dir, output_base_dir, backend="pipeline", force=False):
     from mineru_parse_pdf import do_parse
     datas_dir = Path(datas_dir)
     output_base_dir = Path(output_base_dir)
-    pdf_files = list(datas_dir.rglob('*.pdf'))
+    pdf_files = [p for p in datas_dir.rglob('*.pdf') if "checkpoint" not in p.as_posix().lower()]
     if not pdf_files:
         print(f"未找到PDF文件于: {datas_dir}")
         return
+
+    subdir = "auto" if backend == "pipeline" else "vlm"
+
     for pdf_path in pdf_files:
         file_name = pdf_path.stem
+        output_dir = output_base_dir / file_name
+
+        # —— 关键：同时考虑两种目录结构（MinerU 有时会多套一层 file_name）——
+        candidate1 = output_dir / subdir / f"{file_name}_content_list.json"
+        candidate2 = output_dir / file_name / subdir / f"{file_name}_content_list.json"
+
+        # ✅ 已存在则跳过（除非 force=True）
+        if (candidate1.exists() or candidate2.exists()) and not force:
+            print(f"[跳过] 已有解析结果: {candidate1 if candidate1.exists() else candidate2}")
+            continue
+
+        output_dir.mkdir(parents=True, exist_ok=True)
         with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
-        output_dir = output_base_dir / file_name
-        output_dir.mkdir(parents=True, exist_ok=True)
+
         do_parse(
-            output_dir=str(output_dir),
+            output_dir=str(output_dir),             # 保持不变；MinerU 可能会套一层
             pdf_file_names=[file_name],
             pdf_bytes_list=[pdf_bytes],
             p_lang_list=["ch"],
@@ -37,8 +48,12 @@ def parse_all_pdfs(datas_dir, output_base_dir, backend="pipeline"):
             f_dump_orig_pdf=False,
             f_dump_content_list=True
         )
-        subdir = "auto" if backend == "pipeline" else "vlm"
-        print(f"已输出: {output_dir / subdir / (file_name + '_content_list.json')}")
+
+        # 跑完后再检测实际落地在哪个路径并打印
+        actual = candidate1 if candidate1.exists() else (candidate2 if candidate2.exists() else None)
+        print(f"已输出: {actual or (output_dir / subdir / f'{file_name}_content_list.json')}")
+
+
 
 def group_by_page(content_list):
     pages = defaultdict(list)
@@ -47,10 +62,12 @@ def group_by_page(content_list):
         pages[page_idx].append(item)
     return dict(pages)
 
-def item_to_markdown(item, enable_image_caption=True):
+def item_to_markdown(item, enable_image_caption=True, img_base: Path | str | None = None):
     """
     enable_image_caption: 是否启用多模态视觉分析（图片caption补全），默认True。
     """
+    if isinstance(img_base, str):
+        img_base = Path(img_base)
     # 默认API参数：硅基流动Qwen/Qwen2.5-VL-32B-Instruct
     vision_provider = "guiji"
     vision_model = "Pro/Qwen/Qwen2.5-VL-7B-Instruct"
@@ -70,17 +87,19 @@ def item_to_markdown(item, enable_image_caption=True):
         orig_caption_list = item.get('image_caption', [])
         orig_caption = orig_caption_list[0] if orig_caption_list else ''
         img_path = item.get('img_path', '')
-        
-        abs_img_path = Path(img_path)
-        if not abs_img_path.is_absolute():
-            if img_base is not None:
-                abs_img_path = (img_base / img_path).resolve()
+
+        abs_img_path = None
+        if img_path:  # 只在非空时解析
+            p = Path(img_path)
+            if p.is_absolute():
+                abs_img_path = p
             else:
-                abs_img_path = abs_img_path.resolve()  # 尝试用当前工作目录解析        
+                abs_img_path = (Path(img_base) / p).resolve() if img_base else p.resolve()
+
 
         sem_caption = ''
         chart_facts = {}    # 结构化结果
-        if enable_image_caption and img_path and os.path.exists(img_path):
+        if enable_image_caption and abs_img_path and abs_img_path.exists()and abs_img_path.is_file():
             print(f"[VLM] start  -> {abs_img_path}")
             try:
                 loop = asyncio.new_event_loop()
@@ -95,10 +114,10 @@ def item_to_markdown(item, enable_image_caption=True):
                         # 优先用“图表专用”提示词；若失败再用通用
                         from image_utils.prompts import get_chart_analysis_prompt, get_image_analysis_prompt
                         prompt = get_chart_analysis_prompt()
-                        r = await analyzer.analyze_image(local_image_path=img_path, prompt=prompt)
+                        r = await analyzer.analyze_image(local_image_path=str(abs_img_path), prompt=prompt)
                         if not r or ("title" not in r and "description" not in r):
                             r = await analyzer.analyze_image(
-                                local_image_path=img_path,
+                                local_image_path=str(abs_img_path),
                                 prompt=get_image_analysis_prompt(20, 80)
                             )
                         return r or {}
@@ -150,7 +169,7 @@ def item_to_markdown(item, enable_image_caption=True):
     else:
         return '\n'
 
-def assemble_pages_to_markdown(pages, img_base: Path | None = None):
+def assemble_pages_to_markdown(pages, img_base: Path | str | None = None):
     page_md = {}
     for page_idx in sorted(pages.keys()):
         md = ''
@@ -169,6 +188,20 @@ def _first_text(v):
     if isinstance(v, str):
         return v.strip()
     return ""
+
+def _norm_val(v: str) -> str:
+    s = v.strip().replace(",", "")
+    # 缺失占位统一为 NA（不要 0）
+    if s in ("—", "-", "N/A", "NA", "null", "None", ""):
+        return "NA"
+    # 百分比：保留原值 + 提供一个 0-1 的小数，利于检索
+    if s.endswith("%"):
+        try:
+            p = float(s[:-1])
+            return f"{s} {p/100:g}"
+        except:
+            return s
+    return s
 
 def build_embed_text_for_page(items: list) -> str:
     parts = []
@@ -202,21 +235,93 @@ def build_embed_text_for_page(items: list) -> str:
             ).strip()
             parts.append(block)
         elif t == 'table':
-            # 关键：table_caption 可能是 [], None, 或 str
-            cap = _first_text(it.get('table_caption'))
-            if cap:
-                parts.append(f"【表】{cap}")
-            else:
-                # 兜底：如果没有 caption，尽量从其他字段给一点可检索的文本
-                title = _first_text(it.get('title') or it.get('summary'))
-                if title:
-                    parts.append(f"【表】{title}")
+            import re, html as _html
+
+            def _strip_tags(s: str) -> str:
+                s = re.sub(r"<[^>]+>", "", s)
+                return _html.unescape(s).strip()
+
+            def _parse_table(html: str):
+                if not html:
+                    return [], []
+                trs = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE|re.DOTALL)
+                rows = []
+                for tr in trs:
+                    cells = re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", tr, flags=re.IGNORECASE|re.DOTALL)
+                    cells = [_strip_tags(c) for c in cells]
+                    if any(c.strip() for c in cells):
+                        rows.append(cells)
+
+                if not rows:
+                    return [], []
+
+                def _looks_like_years(cols):
+                    hits = 0
+                    for c in cols:
+                        if re.search(r"20\d{2}\s*[AE]?$", c) or re.search(r"20\d{2}\s*[AE]\b", c):
+                            hits += 1
+                    return hits >= max(2, len(cols)//2)
+
+                header = []
+                if rows and (("会计年度" in rows[0][0]) or _looks_like_years(rows[0][1:])):
+                    header = rows[0]
+                    data_rows = rows[1:]
                 else:
-                    parts.append("【表】")
+                    data_rows = rows
+                return header, data_rows
+
+            cap = _first_text(it.get('table_caption')) or _first_text(it.get('title') or it.get('summary')) or ""
+            html_body = it.get('table_body') or ""
+            header, data_rows = _parse_table(html_body)
+
+            lines = []
+            if cap:
+                lines.append(f"【表】{cap}")
+
+            if header and len(header) > 1:
+                years = " ".join(h.strip() for h in header[1:] if h.strip())
+                if years:
+                    lines.append(f"列: {years}")
+
+            for row in data_rows:
+                if not row:
+                    continue
+                name = row[0].strip()
+                if not name or name in ("会计年度",):
+                    continue
+                vals = [_norm_val(c) for c in row[1:] if str(c).strip() != ""]
+                if vals:
+                    lines.append(f"{name}: " + " ".join(vals))
+                else:
+                    lines.append(name)
+
+            if not lines:
+                lines.append(f"【表】{cap or '表'}")
+
+            parts.append("\n".join(lines))
         else:
             # 其他类型忽略或做兜底
             pass
-    return "\n".join(p for p in parts if p).strip()
+        
+    out = "\n".join(p for p in parts if p).strip()
+
+    # 最后再做一次统一清洗（去掉可能混入的 Markdown/HTML）
+# 最后再做一次统一清洗（去掉可能混入的 Markdown/HTML）
+    import re, html as _html, unicodedata
+
+    out = re.sub(r"<[^>]+>", " ", out)              # 去 HTML 标签
+    out = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", out) # 去图片语法 ![...](...)
+    # 去掉行首的标题/列表/引用标记（但不影响数值里的'-'）
+    out = re.sub(r"^\s{0,3}#{1,6}\s+", "", out, flags=re.MULTILINE)  # # 标题
+    out = re.sub(r"^\s{0,3}>\s+", "", out, flags=re.MULTILINE)       # 引用 >
+    out = re.sub(r"^\s{0,3}[-*+]\s+", "", out, flags=re.MULTILINE)   # 列表 -,*,+
+    out = out.replace("`", "")                                        # 反引号
+    out = _html.unescape(out)
+    out = unicodedata.normalize("NFKC", out)
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    return out
+
+
 
 
 def process_all_pdfs_to_page_json(input_base_dir, output_base_dir):
@@ -225,7 +330,8 @@ def process_all_pdfs_to_page_json(input_base_dir, output_base_dir):
     """
     input_base_dir = Path(input_base_dir)
     output_base_dir = Path(output_base_dir)
-    pdf_dirs = [d for d in input_base_dir.iterdir() if d.is_dir()]
+    pdf_dirs = [d for d in input_base_dir.iterdir()
+                if d.is_dir() and "checkpoint" not in d.name.lower()]
     for pdf_dir in pdf_dirs:
         file_name = pdf_dir.name
         candidates = [
@@ -246,8 +352,7 @@ def process_all_pdfs_to_page_json(input_base_dir, output_base_dir):
             content_list = json.load(f)
         pages = group_by_page(content_list)
         page_md = assemble_pages_to_markdown(pages, img_base=json_path.parent)
-        page_embed = {str(pg): build_embed_text_for_page(pages[pg]) for pg in pages}# 之后的 get(str(pg)) 保持不变
-
+        page_embed = {str(pg): build_embed_text_for_page(pages[pg]) for pg in sorted(pages)}
         
         output_dir = output_base_dir / file_name
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -271,7 +376,7 @@ def process_page_content_to_chunks(input_base_dir, output_json_path):
     
     all_chunks = []
     for pdf_dir in input_base_dir.iterdir():
-        if not pdf_dir.is_dir():
+        if not pdf_dir.is_dir() or "checkpoint" in pdf_dir.name.lower():
             continue
         file_name = pdf_dir.name
         page_content_path = pdf_dir / f"{file_name}_page_content.json"
@@ -306,14 +411,14 @@ def process_page_content_to_chunks(input_base_dir, output_json_path):
     
 
 
-def main():
+def main(force=False):
     base_dir = Path(__file__).parent
-    datas_dir = base_dir / 'pdftest'
+    datas_dir = base_dir / 'datas'
     content_dir = base_dir / 'data_base_json_content'
     page_dir = base_dir / 'data_base_json_page_content'
     chunk_json_path = base_dir / 'all_pdf_page_chunks.json'
     # 步骤1：PDF → content_list.json
-    parse_all_pdfs(datas_dir, content_dir, backend="vlm-transformers")
+    parse_all_pdfs(datas_dir, content_dir, backend="vlm-transformers", force=False)
     # 步骤2：content_list.json → page_content.json
     process_all_pdfs_to_page_json(content_dir, page_dir)
     # 步骤3：page_content.json → all_pdf_page_chunks.json
