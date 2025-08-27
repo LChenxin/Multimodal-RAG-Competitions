@@ -28,6 +28,7 @@ output/
 output/test/
 output/test/auto/
 caches/
+diagnostics/
 .embedding_cache/
 *.db
 *.db-shm
